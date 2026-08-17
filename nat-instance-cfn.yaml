@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to deploy a cost-effective NAT Instance (t4g.nano) in a public subnet to allow private subnet resources to access the internet (such as Supabase).'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC where the NAT Instance will be deployed.
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the Public Subnet where the NAT Instance will reside (must have an attached Internet Gateway).
+  PrivateRouteTableId:
+    Type: AWS::EC2::RouteTable::Id
+    Description: Select the Route Table of your Private Subnet to automatically add the 0.0.0.0/0 route pointing to this NAT Instance.
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block of the private subnet (used for security group inbound rules to limit access).
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Optional KeyPair name for SSH access to the NAT Instance. Leave blank if not required.
+    Default: ""
+
+Conditions:
+  HasKeyPair: !Not [ !Equals [ !Ref KeyPairName, "" ] ]
+
+Resources:
+  # Elastic IP for the NAT Instance (Required to maintain a consistent public IP)
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # EIP Association
+  NatEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref NatInstance
+      AllocationId: !GetAtt NatEip.AllocationId
+
+  # Security Group for the NAT Instance
+  NatSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for NAT Instance allowing traffic from private subnet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Allow PostgreSQL (5432) from Private Subnet (for Supabase)
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref PrivateSubnetCidr
+        # Allow PostgreSQL Connection Pooler (6543) from Private Subnet
+        - IpProtocol: tcp
+          FromPort: 6543
+          ToPort: 6543
+          CidrIp: !Ref PrivateSubnetCidr
+        # Allow HTTP/HTTPS for outbound web traffic / API calls from private subnet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref PrivateSubnetCidr
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref PrivateSubnetCidr
+        # Optional SSH access (Default restricted to VPC, change to 0.0.0.0/0 only if absolutely necessary)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref PrivateSubnetCidr
+      SecurityGroupEgress:
+        # Allow all outbound traffic to the internet
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  # NAT Instance EC2
+  NatInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t4g.nano # Extremely cost-effective Graviton instance (approx. $3-4/month)
+      # Dynamically resolves the latest Amazon Linux 2023 AMI for arm64 (Graviton)
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds:
+        - !Ref NatSecurityGroup
+      # CRITICAL: Disable Source/Destination check to allow the instance to act as a router
+      SourceDestCheck: false
+      KeyName: !If [ HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue" ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NAT-Instance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Enable IP forwarding in the Linux kernel
+          echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+          sysctl -p
+
+          # Install and configure iptables for IP Masquerading (NAT)
+          dnf install -y iptables-services
+          systemctl enable iptables
+          systemctl start iptables
+
+          # Automatically detect the primary network interface (usually eth0)
+          PRIMARY_INTERFACE=$(ip route | grep default | awk '{print $5}')
+
+          # Apply MASQUERADE rule to NAT outgoing packets
+          iptables -t nat -A POSTROUTING -o $PRIMARY_INTERFACE -j MASQUERADE
+          service iptables save
+
+  # Route pointing all internet-bound traffic (0.0.0.0/0) from the Private Subnet to this NAT Instance
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableId
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+Outputs:
+  NatInstanceId:
+    Description: Instance ID of the NAT Instance
+    Value: !Ref NatInstance
+  NatPublicIp:
+    Description: Elastic IP address of the NAT Instance. REGISTER THIS IP on Supabase dashboard if Network Restrictions are enabled.
+    Value: !Ref NatEip
