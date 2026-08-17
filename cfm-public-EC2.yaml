@@ -5,7 +5,7 @@ Parameters:
   MyIP:
     Type: String
     Description: 'Your Public IP address to allow SSH (e.g., 1.2.3.4/32)'
-    Default: '125.196.132.192/32' # セキュリティのため自分のIPを指定することを推奨
+    Default: '127.0.0.1/32' # セキュリティのため自分のIPを指定することを推奨
 
 Resources:
   # 1. ネットワーク周り
